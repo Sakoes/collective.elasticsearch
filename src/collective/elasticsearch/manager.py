@@ -30,7 +30,6 @@ INDEX_VERSION_ATTR = "_elasticindexversion"
 
 @implementer(interfaces.IElasticSearchManager)
 class ElasticSearchManager:
-
     _catalog: CatalogTool = None
     connection_key = "elasticsearch_connection"
 
@@ -198,7 +197,17 @@ class ElasticSearchManager:
         except exceptions.TransportError as exc:
             if exc.error != "illegal_argument_exception":
                 raise
-            conn.indices.delete_alias(index="_all", name=self.real_index_name)
+            try:
+                aliased = conn.indices.get_alias(name=self.real_index_name)
+            except exceptions.NotFoundError:
+                aliased = {}
+            for concrete_index in aliased:
+                try:
+                    conn.indices.delete_alias(
+                        index=concrete_index, name=self.real_index_name
+                    )
+                except exceptions.NotFoundError:
+                    pass
 
         if self.index_version:
             try:
