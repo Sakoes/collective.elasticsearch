@@ -28,7 +28,6 @@ INDEX_VERSION_ATTR = "_elasticindexversion"
 
 @implementer(interfaces.IElasticSearchManager)
 class ElasticSearchManager:
-
     _catalog: CatalogTool = None
     connection_key = "elasticsearch_connection"
 
@@ -137,12 +136,31 @@ class ElasticSearchManager:
         except exceptions.TransportError as exc:
             if exc.error != "illegal_argument_exception":
                 raise
-            conn.indices.delete_alias(index="_all", name=self.real_index_name)
-
-        if self.index_version:
             try:
-                conn.indices.delete_alias(self.index_name, self.real_index_name)
+                aliased = conn.indices.get_alias(name=self.real_index_name)
             except exceptions.NotFoundError:
+                aliased = {}
+            for concrete_index in aliased:
+                try:
+                    conn.indices.delete_alias(
+                        index=concrete_index, name=self.real_index_name
+                    )
+                except exceptions.NotFoundError:
+                    pass
+
+        # Only attempt to drop the alias when we actually use a versioned
+        # index. When a custom index name is set, ``real_index_name`` equals
+        # ``index_name`` and there is no alias to remove (the concrete index
+        # was already deleted above).
+        if self.index_version and self.real_index_name != self.index_name:
+            try:
+                # The alias name is ``index_name`` and it points to the
+                # versioned ``real_index_name``. ``delete_alias`` expects
+                # ``(index, name)``.
+                conn.indices.delete_alias(
+                    index=self.real_index_name, name=self.index_name
+                )
+            except (exceptions.NotFoundError, exceptions.TransportError):
                 pass
         self.flush_indices()
         self._convert_catalog_to_elastic()
@@ -170,7 +188,16 @@ class ElasticSearchManager:
             logger.error(f"Error in bulk operation: {result}")
 
     def flush_indices(self):
-        self.connection.indices.flush()
+        # Only flush the index owned by this catalog. Calling ``flush()``
+        # without an index performs a cluster-wide flush (``POST /_flush``),
+        # which requires the ``indices:admin/flush`` privilege at the cluster
+        # level. On secured clusters the Plone service user is typically only
+        # granted permissions on its own index, so a global flush results in a
+        # 403 AuthorizationException.
+        try:
+            self.connection.indices.flush(index=self.real_index_name)
+        except exceptions.NotFoundError:
+            pass
 
     def bulk(self, data: list):
         index_name = self.index_name
