@@ -1,4 +1,5 @@
 from collective.elasticsearch.tests import BaseFunctionalTest
+from collective.elasticsearch.interfaces import IReindexActive
 from collective.elasticsearch.utils import getESOnlyIndexes
 from collective.elasticsearch.utils import getUID
 from plone import api
@@ -6,7 +7,9 @@ from plone.app.contentrules.actions.move import MoveAction
 from plone.app.contentrules.tests.dummy import DummyEvent
 from plone.contentrules.rule.interfaces import IExecutable
 from Products.CMFCore.indexing import processQueue
+from unittest import mock
 from zope.component import getMultiAdapter
+from zope.interface import alsoProvides
 
 
 class TestQueueProcessor(BaseFunctionalTest):
@@ -62,6 +65,48 @@ class TestQueueProcessor(BaseFunctionalTest):
         ex = getMultiAdapter((target, e, DummyEvent(obj)), IExecutable)
         self.assertEqual(True, ex())
         self.assertIn(obj_uid, processor.actions.index)
+
+
+class TestRebuildBatching(BaseFunctionalTest):
+    def test_batch_flush_during_rebuild(self):
+        processor = self.get_processor()
+        alsoProvides(self.request, IReindexActive)
+        processor._rebuild_batch_size = 5
+        try:
+            for idx in range(12):
+                api.content.create(
+                    self.portal, "Document", f"batch-doc-{idx}", title=f"Doc {idx}"
+                )
+            with mock.patch.object(
+                processor.manager, "bulk", wraps=processor.manager.bulk
+            ) as bulk:
+                processQueue()
+                # More than one mid-rebuild flush should have happened
+                self.assertGreater(bulk.call_count, 1)
+            # After flushing, the accumulator is reset
+            self.assertTrue(
+                processor._actions is None or len(processor._actions) < 5
+            )
+        finally:
+            processor._rebuild_batch_size = 1000
+
+    def test_no_flush_without_rebuild(self):
+        processor = self.get_processor()
+        self.assertFalse(processor.rebuild)
+        processor._rebuild_batch_size = 2
+        try:
+            for idx in range(5):
+                api.content.create(
+                    self.portal, "Document", f"nonrebuild-{idx}", title=f"Doc {idx}"
+                )
+            with mock.patch.object(
+                processor.manager, "bulk", wraps=processor.manager.bulk
+            ) as bulk:
+                processQueue()
+                # Without rebuild there is a single flush at commit time
+                self.assertLessEqual(bulk.call_count, 1)
+        finally:
+            processor._rebuild_batch_size = 1000
 
 
 class TestMoveReindex(BaseFunctionalTest):

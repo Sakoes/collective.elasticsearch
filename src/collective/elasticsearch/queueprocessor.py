@@ -11,8 +11,11 @@ from plone.indexer.interfaces import IIndexableObject
 from plone.indexer.interfaces import IIndexer
 from zope.component import getAdapters
 from zope.component import queryMultiAdapter
+from zope.component.hooks import getSite
 from zope.globalrequest import getRequest
 from zope.interface import implementer
+
+import transaction
 
 
 @implementer(IElasticSearchIndexQueueProcessor)
@@ -24,6 +27,10 @@ class IndexProcessor:
     _all_attributes = None
     rebuild: bool = False
     _actions: IndexingActions = None
+    # During a full rebuild we must not accumulate the whole site in memory.
+    # Flush to elasticsearch every N objects and let the ZODB connection
+    # cache be garbage collected in between.
+    _rebuild_batch_size: int = 1000
 
     @property
     def manager(self):
@@ -108,6 +115,36 @@ class IndexProcessor:
             # Remove from unindex
             actions.unindex.pop(uuid)
         actions.index[uuid] = data
+        self._maybe_flush_rebuild()
+
+    def _maybe_flush_rebuild(self):
+        """Bound memory during a full rebuild by flushing accumulated batches
+        to elasticsearch and releasing the ZODB cache periodically instead of
+        holding the whole site in memory until commit()."""
+        if not self.rebuild:
+            return
+        actions = self._actions
+        if not actions or len(actions) < self._rebuild_batch_size:
+            return
+        self._flush_rebuild_batch()
+
+    def _flush_rebuild_batch(self):
+        actions = self._actions
+        if self.manager.active and actions and len(actions):
+            self.manager.bulk(data=actions.all())
+        # Drop the processed batch and release the ZODB cache so the objects
+        # we just indexed can be garbage collected.
+        self._actions = None
+        try:
+            site = getSite()
+            jar = getattr(site, "_p_jar", None)
+            if jar is not None:
+                transaction.savepoint(optimistic=True)
+                jar.cacheGC()
+        except Exception:  # NOQA W0703
+            logger.warning(
+                "Could not release ZODB cache during rebuild", exc_info=True
+            )
 
     def reindex(self, obj, attributes=None, update_metadata=False):
         """Reindex the specified attributes for an obj."""
